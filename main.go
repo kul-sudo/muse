@@ -2,164 +2,306 @@ package main
 
 import (
 	"crypto"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"github.com/ProtonMail/bcrypt"
 	"github.com/ProtonMail/gopenpgp/v3/constants"
 	pgpCrypto "github.com/ProtonMail/gopenpgp/v3/crypto"
 	"github.com/ProtonMail/gopenpgp/v3/profile"
 	"github.com/opencoff/go-srp"
-	"golang.org/x/crypto/bcrypt"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 )
 
-type Username = string
-
-const SRP_BITS int = 1024
+const SRP_BITS int = 2048
+const REGISTER_ERROR string = "Error registering."
+const INCORRECT_PASSWORD_ERROR string = "Incorrect password."
 const LOGIN_ERROR string = "Error logging in."
+const SEND_ERROR string = "Send error."
+const BCRYPT_MAX_COST_PART float32 = 0.5
 
-func register(w http.ResponseWriter, r *http.Request, users *map[Username][]string, pgp *pgpCrypto.PGPHandle) {
+type User struct {
+	PrivateKey string   `json:"privateKey"`
+	Verifier   string   `json:"verifier"`
+	Messages   []string `json:"messages"`
+	Salt       string   `json:"salt"`
+}
+
+func register(w http.ResponseWriter, r *http.Request, pgp *pgpCrypto.PGPHandle) {
 	query := r.URL.Query()
 
-	var username Username = query.Get("username")
+	username := query.Get("username")
 	password := query.Get("password")
 
-	userPrivateKey, _ := pgp.KeyGeneration().
+	// Handle requirements for credentials
+	if len(username) == 0 {
+		fmt.Fprintf(w, "The username can't be empty.")
+		return
+	}
+
+	if len(password) == 0 || len(password) >= 72 {
+		fmt.Fprintf(w, "The password length has to be within the range 0..=72.")
+		return
+	}
+
+	// Key generation
+	userPrivateKey, err := pgp.KeyGeneration().
 		AddUserId("username", "").
 		New().GenerateKeyWithSecurity(constants.HighSecurity)
-
-	bytePassword := []byte(password)
-
-	hash, _ := bcrypt.GenerateFromPassword(bytePassword, bcrypt.DefaultCost)
-	pgp.LockKey(userPrivateKey, hash)
-
-	(*users)[username] = make([]string, 0)
-
-	byteUsername := []byte(username)
-
-	s, err := srp.NewWithHash(crypto.SHA256, SRP_BITS)
 	if err != nil {
-		panic(err)
+		fmt.Fprintf(w, REGISTER_ERROR)
+		return
 	}
 
-	v, err := s.Verifier(byteUsername, bytePassword)
+	// Bcrypt hash generation
+	salt, err := bcrypt.Salt()
 	if err != nil {
-		panic(err)
+		fmt.Fprintf(w, REGISTER_ERROR)
+		return
 	}
 
-	ih, vh := v.Encode()
+	hash, err := bcrypt.Hash(password, salt)
+	if err != nil {
+		fmt.Fprintf(w, REGISTER_ERROR)
+		return
+	}
 
-	os.MkdirAll(filepath.Join("users", ih), os.ModePerm)
-	cwd, _ := os.Getwd()
-	privateKeyFile, _ := os.Create(filepath.Join(cwd, "users", ih, "private.asc"))
-	defer privateKeyFile.Close()
-	armorPrivateKey, _ := userPrivateKey.Armor()
-	privateKeyFile.WriteString(armorPrivateKey)
+	lockedKey, err := pgp.LockKey(userPrivateKey, []byte(hash))
+	userPrivateKey = lockedKey
 
-	verifierFile, _ := os.Create(filepath.Join(cwd, "users", ih, "verifier"))
-	defer verifierFile.Close()
-	verifierFile.WriteString(vh)
+	// SRP
+	srpEnv, err := srp.NewWithHash(crypto.SHA256, SRP_BITS)
+	if err != nil {
+		fmt.Fprintf(w, REGISTER_ERROR)
+		return
+	}
+
+	verifier, err := srpEnv.Verifier([]byte(username), []byte(password))
+	if err != nil {
+		fmt.Fprintf(w, REGISTER_ERROR)
+		return
+	}
+
+	identity, verifierString := verifier.Encode()
+
+	// Add to the database
+	os.Mkdir("users", os.ModePerm)
+	cwd, err := os.Getwd()
+	if err != nil {
+		fmt.Fprintf(w, REGISTER_ERROR)
+		return
+	}
+
+	userFile, err := os.Create(filepath.Join(cwd, "users", identity+".json"))
+	armorPrivateKey, err := userPrivateKey.Armor()
+	if err != nil {
+		fmt.Fprintf(w, REGISTER_ERROR)
+		return
+	}
+
+	user := User{armorPrivateKey, verifierString, make([]string, 0), salt}
+	userMarshal, err := json.Marshal(user)
+	if err != nil {
+		fmt.Fprintf(w, REGISTER_ERROR)
+		return
+	}
+
+	userFile.WriteString(string(userMarshal))
 
 	fmt.Fprintf(w, "Success.")
 }
 
-func login(w http.ResponseWriter, r *http.Request, users *map[Username][]string) {
+func login(w http.ResponseWriter, r *http.Request, pgp *pgpCrypto.PGPHandle) {
 	query := r.URL.Query()
 
-	var username Username = query.Get("username")
+	// Login
+	username := query.Get("username")
 	password := query.Get("password")
 
-	bytePassword := []byte(password)
-	byteUsername := []byte(username)
+	// Working with the credentials the user thinks are correct
+	srpEnv, err := srp.NewWithHash(crypto.SHA256, SRP_BITS)
+	if err != nil {
+		fmt.Fprintf(w, LOGIN_ERROR)
+		return
+	}
 
-	s, _ := srp.NewWithHash(crypto.SHA256, SRP_BITS)
+	client, err := srpEnv.NewClient([]byte(username), []byte(password))
+	if err != nil {
+		fmt.Fprintf(w, LOGIN_ERROR)
+		return
+	}
 
-	v, _ := s.Verifier(byteUsername, bytePassword)
+	credsClient := client.Credentials()
 
-	ih, _ := v.Encode()
+	identity, A, err := srp.ServerBegin(credsClient)
+	if err != nil {
+		fmt.Fprintf(w, LOGIN_ERROR)
+		return
+	}
 
-	cwd, _ := os.Getwd()
-	dat, err := os.ReadFile(filepath.Join(cwd, "users", ih, "verifier"))
+	// Fetch user from the database
+	cwd, err := os.Getwd()
+	if err != nil {
+		fmt.Fprintf(w, LOGIN_ERROR)
+		return
+	}
+
+	user := User{}
+	data, err := os.ReadFile(filepath.Join(cwd, "users", identity+".json"))
 	if err != nil {
 		fmt.Fprintf(w, "Maybe you haven't registered?")
-		return
 	}
+	json.Unmarshal(data, &user)
 
-	vh := string(dat)
-	c, err := s.NewClient(byteUsername, bytePassword)
+	// Working with the data stored in the database
+	srpEnvStored, verifierStored, err := srp.MakeSRPVerifier(user.Verifier)
 	if err != nil {
 		fmt.Fprintf(w, LOGIN_ERROR)
 		return
 	}
 
-	// client credentials (public key and identity) to send to server
-	creds := c.Credentials()
-
-	// Begin the server by parsing the client public key and identity.
-	ih, A, err := srp.ServerBegin(creds)
+	srv, err := srpEnvStored.NewServer(verifierStored, A)
 	if err != nil {
 		fmt.Fprintf(w, LOGIN_ERROR)
 		return
 	}
 
-	// Now, pretend to lookup the user db using "I" as the key and
-	// fetch salt, verifier etc.
-	s, v, err = srp.MakeSRPVerifier(vh)
+	credsServer := srv.Credentials()
+
+	cauth, err := client.Generate(credsServer)
 	if err != nil {
 		fmt.Fprintf(w, LOGIN_ERROR)
 		return
 	}
 
-	srv, err := s.NewServer(v, A)
-	if err != nil {
-		fmt.Fprintf(w, LOGIN_ERROR)
-		return
-	}
-
-	// Generate the credentials to send to client
-	creds = srv.Credentials()
-
-	// client processes the server creds and generates
-	// a mutual authenticator; the authenticator is sent
-	// to the server as proof that the client derived its keys.
-	cauth, err := c.Generate(creds)
-	if err != nil {
-		fmt.Fprintf(w, LOGIN_ERROR)
-		return
-	}
-
-	// Receive the proof of authentication from client
+	// Verification
 	proof, ok := srv.ClientOk(cauth)
 	if !ok {
-		fmt.Fprintf(w, LOGIN_ERROR)
+		fmt.Fprintf(w, INCORRECT_PASSWORD_ERROR)
 		return
 	}
 
-	// Verify the server's proof
-	if !c.ServerOk(proof) {
-		fmt.Fprintf(w, LOGIN_ERROR)
+	if !client.ServerOk(proof) {
+		fmt.Fprintf(w, INCORRECT_PASSWORD_ERROR)
 		return
 	}
 
-	kc := c.RawKey()
+	kc := client.RawKey()
 	ks := srv.RawKey()
 
-	if 1 != subtle.ConstantTimeCompare(kc, ks) {
-		fmt.Fprintf(w, LOGIN_ERROR)
+	if subtle.ConstantTimeCompare(kc, ks) == 0 {
+		fmt.Fprintf(w, INCORRECT_PASSWORD_ERROR)
 		return
 	}
 
-	fmt.Fprintf(w, "Logged in.")
+	// Print out the messages
+	hash, err := bcrypt.Hash(password, user.Salt)
+	privateKey, err := pgpCrypto.NewPrivateKeyFromArmored(user.PrivateKey, []byte(hash))
+	if err != nil {
+		fmt.Fprintln(w, "Error unlocking the key.")
+		return
+	}
+	decryptionHandle, err := pgp.Decryption().DecryptionKey(privateKey).New()
+	if err != nil {
+		fmt.Fprintln(w, "DecryptionHandle error.")
+		return
+	}
+
+	for i := 0; i < len(user.Messages); i++ {
+		messageElement := user.Messages[i]
+		// Decrypt data with a password
+		decrypted, err := decryptionHandle.Decrypt([]byte(messageElement), pgpCrypto.Armor)
+		if err != nil {
+			fmt.Fprintln(w, "Decryption error.")
+			return
+		}
+
+		myMessage := decrypted.Bytes()
+		fmt.Fprintln(w, "anon: "+string(myMessage))
+	}
+
+	decryptionHandle.ClearPrivateParams()
+}
+
+func send(w http.ResponseWriter, r *http.Request, pgp *pgpCrypto.PGPHandle) {
+	query := r.URL.Query()
+	cwd, err := os.Getwd()
+	if err != nil {
+		fmt.Fprintf(w, SEND_ERROR)
+		return
+	}
+
+	recipientHash := sha256.New()
+	recipientHash.Write([]byte(query.Get("recipient")))
+	recipient := hex.EncodeToString(recipientHash.Sum(nil))
+
+	recipientUser := User{}
+	recipientData, err := os.ReadFile(filepath.Join(cwd, "users", recipient+".json"))
+	if err != nil {
+		fmt.Fprintf(w, "Maybe the recipient doesn't exist?")
+		return
+	}
+	json.Unmarshal(recipientData, &recipientUser)
+
+	recipientPrivateKey, err := pgpCrypto.NewKeyFromArmored(recipientUser.PrivateKey)
+	if err != nil {
+		fmt.Fprintf(w, SEND_ERROR)
+		return
+	}
+
+	recipientPublicKey, err := recipientPrivateKey.ToPublic()
+	if err != nil {
+		fmt.Fprintf(w, SEND_ERROR)
+		return
+	}
+
+	encryptionHandle, err := pgp.Encryption().Recipient(recipientPublicKey).New()
+	if err != nil {
+		fmt.Fprintf(w, SEND_ERROR)
+		return
+	}
+
+	message := query.Get("message")
+	pgpMessage, err := encryptionHandle.Encrypt([]byte(message))
+	if err != nil {
+		fmt.Fprintf(w, SEND_ERROR)
+		return
+	}
+
+	armored, err := pgpMessage.Armor()
+	if err != nil {
+		fmt.Fprintf(w, SEND_ERROR)
+		return
+	}
+
+	encryptionHandle.ClearPrivateParams()
+	recipientUser.Messages = append(recipientUser.Messages, armored)
+
+	recipientFile, err := os.Create(filepath.Join(cwd, "users", recipient+".json"))
+	if err != nil {
+		fmt.Fprintf(w, SEND_ERROR)
+		return
+	}
+
+	recipientMarshal, err := json.Marshal(recipientUser)
+	if err != nil {
+		fmt.Fprintf(w, SEND_ERROR)
+		return
+	}
+
+	recipientFile.WriteString(string(recipientMarshal))
 }
 
 func main() {
 	pgp := pgpCrypto.PGPWithProfile(profile.RFC9580())
 
-	users := make(map[Username][]string)
-
-	http.HandleFunc("/register", func(writer http.ResponseWriter, request *http.Request) { register(writer, request, &users, pgp) })
-	http.HandleFunc("/login", func(writer http.ResponseWriter, request *http.Request) { login(writer, request, &users) })
+	http.HandleFunc("/register", func(writer http.ResponseWriter, request *http.Request) { register(writer, request, pgp) })
+	http.HandleFunc("/send", func(writer http.ResponseWriter, request *http.Request) { send(writer, request, pgp) })
+	http.HandleFunc("/login", func(writer http.ResponseWriter, request *http.Request) { login(writer, request, pgp) })
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }

@@ -5,6 +5,7 @@ go 1.24.1
 require github.com/ProtonMail/gopenpgp/v3 v3.2.0
 
 require (
+	github.com/ProtonMail/bcrypt v0.0.0-20211005172633-e235017c1baf // indirect
 	github.com/ProtonMail/go-crypto v1.2.0 // indirect
 	github.com/cloudflare/circl v1.6.0 // indirect
 	github.com/opencoff/go-srp v0.6.4 // indirect

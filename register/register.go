@@ -58,7 +58,7 @@ func Register(w http.ResponseWriter, r *http.Request, pgp *pgpCrypto.PGPHandle) 
 	userPrivateKey = lockedKey
 
 	// SRP
-	srpEnv, err := srp.NewWithHash(crypto.SHA256, constants.SRP_BITS)
+	srpEnv, err := srp.NewWithHash(crypto.SHA512, constants.SRP_BITS)
 	if err != nil {
 		fmt.Fprintf(w, constants.REGISTER_ERROR)
 		return

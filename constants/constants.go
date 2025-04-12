@@ -1,6 +1,6 @@
 package constants
 
-const SRP_BITS int = 2048
+const SRP_BITS int = 4096
 const REGISTER_ERROR string = "Error registering."
 const SEND_ERROR string = "Send error."
 const BCRYPT_MAX_COST_PART float32 = 0.5

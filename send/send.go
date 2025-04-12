@@ -1,7 +1,7 @@
 package send
 
 import (
-	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -21,7 +21,7 @@ func Send(w http.ResponseWriter, r *http.Request, pgp *pgpCrypto.PGPHandle) {
 		return
 	}
 
-	recipientHash := sha256.New()
+	recipientHash := sha512.New()
 	recipientHash.Write([]byte(query.Get("recipient")))
 	recipient := hex.EncodeToString(recipientHash.Sum(nil))
 

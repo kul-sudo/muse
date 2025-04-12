@@ -23,7 +23,7 @@ func Login(w http.ResponseWriter, r *http.Request, pgp *pgpCrypto.PGPHandle) {
 	password := query.Get("password")
 
 	// Working with the credentials the user thinks are correct
-	srpEnv, err := srp.NewWithHash(crypto.SHA256, constants.SRP_BITS)
+	srpEnv, err := srp.NewWithHash(crypto.SHA512, constants.SRP_BITS)
 	if err != nil {
 		fmt.Fprintf(w, constants.LOGIN_ERROR)
 		return
@@ -54,6 +54,7 @@ func Login(w http.ResponseWriter, r *http.Request, pgp *pgpCrypto.PGPHandle) {
 	data, err := os.ReadFile(filepath.Join(cwd, "users", identity+".json"))
 	if err != nil {
 		fmt.Fprintf(w, "Maybe you haven't registered?")
+		return;
 	}
 	json.Unmarshal(data, &user)
 

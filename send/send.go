@@ -80,4 +80,6 @@ func Send(w http.ResponseWriter, r *http.Request, pgp *pgpCrypto.PGPHandle) {
 	}
 
 	recipientFile.WriteString(string(recipientMarshal))
+
+	fmt.Fprintf(w, "Sent successfully!")
 }
